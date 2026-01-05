@@ -19,7 +19,7 @@
 // =============================================================================
 // FIRMWARE VERSION (for OTA updates)
 // =============================================================================
-const char* FIRMWARE_VERSION = "1.0.1";
+const char* FIRMWARE_VERSION = "1.0.2";
 
 // =============================================================================
 // CONFIGURATION (stored in NVS, set via captive portal)
@@ -1221,6 +1221,7 @@ void setup()
   {
     Serial.println("Touch button held - forcing setup mode");
     // Wait for button release
+    clearConfiguration(); 
     while (digitalRead(PIN_TOUCH) == HIGH) delay(10);
   }
 
