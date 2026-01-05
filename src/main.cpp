@@ -270,7 +270,6 @@ const char SAVE_HTML[] PROGMEM = R"rawliteral(
 </head>
 <body>
   <div class="container">
-    <div class="icon">✅</div>
     <h1>Settings Saved!</h1>
     <p>Your atmospheric satellite is now configured.<br>The device will restart and connect to your WiFi network.</p>
     <p style="color: #666; font-size: 14px; margin-top: 30px;">
