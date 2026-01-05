@@ -11,14 +11,22 @@
 #include <Preferences.h>
 #include <WebServer.h>
 #include <DNSServer.h>
+#include <HTTPUpdate.h>
+#include <WiFiClientSecure.h>
+#include <esp_ota_ops.h>
 #include "icons.h"
+
+// =============================================================================
+// FIRMWARE VERSION (for OTA updates)
+// =============================================================================
+const char* FIRMWARE_VERSION = "1.0.0";
 
 // =============================================================================
 // CONFIGURATION (stored in NVS, set via captive portal)
 // =============================================================================
 
 // Hardcoded API key for all devices
-const char *ACCUWEATHER_API_KEY = "YOUR_API_KEY";
+const char *ACCUWEATHER_API_KEY = "";
 
 // These are loaded from non-volatile storage
 String cfg_wifiSsid = "";
@@ -727,6 +735,166 @@ void displayScreenTwo()
   }
 }
 
+// =============================================================================
+// OTA UPDATE FUNCTIONS
+// =============================================================================
+
+// OTA Update URLs (GitHub Releases)
+const char* OTA_VERSION_URL = "https://github.com/carsonxyz/weather-satellite/releases/latest/download/version.txt";
+const char* OTA_FIRMWARE_URL = "https://github.com/carsonxyz/weather-satellite/releases/latest/download/firmware.bin";
+const int OTA_TIMEOUT_MS = 30000;  // 30 second timeout for downloads
+
+// Parse semantic version string "major.minor.patch" into components
+// Returns true if parsing succeeded
+bool parseVersion(const char* versionStr, int& major, int& minor, int& patch)
+{
+  major = minor = patch = 0;
+
+  // Copy string to allow modification
+  char buf[32];
+  strncpy(buf, versionStr, sizeof(buf) - 1);
+  buf[sizeof(buf) - 1] = '\0';
+
+  // Trim leading/trailing whitespace and newlines
+  char* start = buf;
+  while (*start && (isspace(*start) || *start == '\n' || *start == '\r')) start++;
+  char* end = start + strlen(start) - 1;
+  while (end > start && (isspace(*end) || *end == '\n' || *end == '\r')) *end-- = '\0';
+
+  // Skip 'v' prefix if present
+  if (*start == 'v' || *start == 'V') start++;
+
+  // Parse major.minor.patch
+  char* token = strtok(start, ".");
+  if (!token) return false;
+  major = atoi(token);
+
+  token = strtok(NULL, ".");
+  if (!token) return false;
+  minor = atoi(token);
+
+  token = strtok(NULL, ".-");  // Stop at dash for pre-release tags
+  if (!token) return false;
+  patch = atoi(token);
+
+  return true;
+}
+
+// Compare two semantic versions
+// Returns: 1 if v1 > v2, -1 if v1 < v2, 0 if equal
+int compareVersions(const char* v1, const char* v2)
+{
+  int major1, minor1, patch1;
+  int major2, minor2, patch2;
+
+  if (!parseVersion(v1, major1, minor1, patch1)) return 0;
+  if (!parseVersion(v2, major2, minor2, patch2)) return 0;
+
+  if (major1 != major2) return (major1 > major2) ? 1 : -1;
+  if (minor1 != minor2) return (minor1 > minor2) ? 1 : -1;
+  if (patch1 != patch2) return (patch1 > patch2) ? 1 : -1;
+
+  return 0;
+}
+
+// Check for and perform OTA firmware updates
+// Call this after WiFi is connected
+void checkForUpdates()
+{
+  Serial.println("\n--- Checking for Firmware Updates ---");
+  Serial.printf("Current firmware version: %s\n", FIRMWARE_VERSION);
+
+  displayCenteredText("Checking for updates...", ST77XX_CYAN);
+
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("WiFi not connected, skipping update check");
+    return;
+  }
+
+  // Mark current firmware as valid (for rollback protection)
+  // This should be called after the firmware has been verified to work
+  esp_ota_mark_app_valid_cancel_rollback();
+
+  HTTPClient http;
+
+  // Configure for HTTPS with GitHub
+  // NOTE: Using insecure mode for simplicity. For production, add GitHub's root CA certificate.
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(OTA_TIMEOUT_MS);
+
+  // Fetch version.txt from GitHub releases
+  Serial.printf("Fetching version from: %s\n", OTA_VERSION_URL);
+  http.begin(OTA_VERSION_URL);
+
+  int httpCode = http.GET();
+
+  if (httpCode != HTTP_CODE_OK)
+  {
+    Serial.printf("Failed to fetch version file. HTTP code: %d\n", httpCode);
+    http.end();
+    Serial.println("Update check failed, continuing with current firmware");
+    return;
+  }
+
+  String remoteVersion = http.getString();
+  remoteVersion.trim();
+  http.end();
+
+  Serial.printf("Remote version: %s\n", remoteVersion.c_str());
+
+  // Compare versions
+  int cmp = compareVersions(remoteVersion.c_str(), FIRMWARE_VERSION);
+
+  if (cmp <= 0)
+  {
+    Serial.println("Firmware is up to date");
+    Serial.println("--- Update Check Complete ---\n");
+    return;
+  }
+
+  // Remote version is newer - perform update
+  Serial.printf("New version available: %s -> %s\n", FIRMWARE_VERSION, remoteVersion.c_str());
+
+  displayCenteredText("Updating firmware...", ST77XX_CYAN);
+
+  Serial.printf("Downloading firmware from: %s\n", OTA_FIRMWARE_URL);
+
+  // Configure HTTPUpdate
+  httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+  // Create WiFiClient for HTTP (GitHub redirects to objects.githubusercontent.com)
+  WiFiClientSecure client;
+  client.setInsecure();  // Skip certificate verification
+  // NOTE: For production, you should add proper certificate validation:
+  // client.setCACert(github_root_ca);
+
+  // Perform the update
+  t_httpUpdate_return ret = httpUpdate.update(client, OTA_FIRMWARE_URL);
+
+  switch (ret)
+  {
+    case HTTP_UPDATE_FAILED:
+      Serial.printf("Update failed. Error (%d): %s\n",
+                    httpUpdate.getLastError(),
+                    httpUpdate.getLastErrorString().c_str());
+      displayCenteredText("Update failed", ST77XX_RED);
+      delay(3000);
+      break;
+
+    case HTTP_UPDATE_NO_UPDATES:
+      Serial.println("No update available");
+      break;
+
+    case HTTP_UPDATE_OK:
+      Serial.println("Update successful! Rebooting...");
+      // Device will reboot automatically after successful update
+      break;
+  }
+
+  Serial.println("--- Update Check Complete ---\n");
+}
+
 void connectToWiFi()
 {
   displayCenteredText("Connecting to Earth...", ST77XX_CYAN);
@@ -1017,6 +1185,7 @@ void setup()
 
   Serial.println("\n\n================================");
   Serial.println("ESP32-C3 Atmospheric Satellite");
+  Serial.printf("Firmware Version: %s\n", FIRMWARE_VERSION);
   Serial.println("================================");
 
   // Initialize outputs
@@ -1066,6 +1235,9 @@ void setup()
 
   // Normal boot - connect to WiFi
   connectToWiFi();
+
+  // Check for OTA firmware updates after WiFi connection
+  checkForUpdates();
 
   // Initialize AHT10 sensor
   Serial.println("Initializing AHT10...");
