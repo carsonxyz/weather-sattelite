@@ -95,29 +95,23 @@ The project uses PlatformIO with the following libraries:
    - Sign up at [AccuWeather Developer Portal](https://developer.accuweather.com/)
    - Create a new app to get your API key
 
-3. **Configure the device** by editing the configuration section at the top of `src/main.cpp`:
+3. **Add your API key** to the configuration section at the top of `src/main.cpp`:
 
    ```cpp
-   const char *WIFI_SSID = "your_wifi_network";
-   const char *WIFI_PASSWORD = "your_wifi_password";
-   const char *LOCATION_POSTAL_CODE = "your_postal_code";
    const char *ACCUWEATHER_API_KEY = "your_api_key";
-   const bool USE_CELSIUS = false;  // true for Celsius, false for Fahrenheit
-   const bool USE_24_HOUR = false;  // true for 24-hour, false for 12-hour
    ```
 
 4. **Upload the firmware** using PlatformIO
 
 ### WiFi Setup (Captive Portal)
 
-On first boot or when WiFi credentials are not configured, the device will:
+On first boot, the device will create a WiFi access point for configuration:
 
-1. Create a WiFi access point named `WeatherSatellite-Setup`
-2. Display connection instructions on the screen
-3. Connect to this network with your phone or computer
-4. A captive portal will open automatically
-5. Enter your WiFi credentials, postal code, and AccuWeather API key
-6. The device will save settings and reboot
+1. Connect to the `WeatherSatellite-Setup` WiFi network from your phone or computer
+2. A captive portal will open automatically
+3. Enter your WiFi credentials, postal code, and display preferences (Celsius/Fahrenheit, 12/24-hour time)
+4. Settings are saved to device memory and persist across reboots
+5. The device will connect to your WiFi network and begin displaying weather data
 
 ### Display Screens
 
