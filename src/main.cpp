@@ -8,18 +8,30 @@
 #include <Adafruit_ST7789.h>
 #include <Adafruit_AHTX0.h>
 #include <time.h>
+#include <Preferences.h>
+#include <WebServer.h>
+#include <DNSServer.h>
 #include "icons.h"
 
 // =============================================================================
-// CONFIGURATION
+// CONFIGURATION (stored in NVS, set via captive portal)
 // =============================================================================
 
-const char *WIFI_SSID = "";
-const char *WIFI_PASSWORD = "";
-const char *LOCATION_POSTAL_CODE = "";
-const char *ACCUWEATHER_API_KEY = "";
-const bool USE_CELSIUS = false;  // Set to true for Celsius, false for Fahrenheit
-const bool USE_24_HOUR = false;  // Set to true for 24-hour time, false for 12-hour
+// Hardcoded API key for all devices
+const char *ACCUWEATHER_API_KEY = "YOUR_API_KEY";
+
+// These are loaded from non-volatile storage
+String cfg_wifiSsid = "";
+String cfg_wifiPassword = "";
+String cfg_postalCode = "";
+String cfg_countryCode = "US";
+bool cfg_useCelsius = false;
+bool cfg_use24Hour = false;
+bool configValid = false;
+
+// Captive portal settings
+const char *AP_SSID = "Satellite-Setup";
+const char *AP_PASSWORD = "";  // Open network for easy setup
 
 // =============================================================================
 // PIN DEFINITIONS
@@ -57,11 +69,15 @@ const bool USE_24_HOUR = false;  // Set to true for 24-hour time, false for 12-h
 
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 Adafruit_AHTX0 aht;
+Preferences preferences;
+WebServer server(80);
+DNSServer dnsServer;
 
 // =============================================================================
 // STATE VARIABLES
 // =============================================================================
 
+bool setupMode = false;  // True when in captive portal setup mode
 bool ahtFound = false;
 bool lightsEnabled = true;
 bool lastTouchState = LOW;
@@ -101,8 +117,283 @@ unsigned long lastForecastFetch = 0;
 const unsigned long FORECAST_REFRESH_INTERVAL = 3600000;  // Refresh forecast every 1 hour
 
 // =============================================================================
+// CONFIGURATION STORAGE FUNCTIONS
+// =============================================================================
+
+void loadConfiguration()
+{
+  preferences.begin("weather", true);  // Read-only mode
+  
+  cfg_wifiSsid = preferences.getString("wifiSsid", "");
+  cfg_wifiPassword = preferences.getString("wifiPass", "");
+  cfg_postalCode = preferences.getString("postalCode", "");
+  cfg_countryCode = preferences.getString("countryCode", "US");
+  cfg_useCelsius = preferences.getBool("useCelsius", false);
+  cfg_use24Hour = preferences.getBool("use24Hour", false);
+  
+  preferences.end();
+  
+  // Configuration is valid if we have the essentials
+  configValid = (cfg_wifiSsid.length() > 0 && cfg_postalCode.length() > 0);
+  
+  Serial.printf("Configuration loaded: %s\n", configValid ? "Valid" : "Invalid/Empty");
+  if (configValid)
+  {
+    Serial.printf("  WiFi SSID: %s\n", cfg_wifiSsid.c_str());
+    Serial.printf("  Postal Code: %s\n", cfg_postalCode.c_str());
+    Serial.printf("  Country: %s\n", cfg_countryCode.c_str());
+    Serial.printf("  Celsius: %s\n", cfg_useCelsius ? "Yes" : "No");
+    Serial.printf("  24-Hour: %s\n", cfg_use24Hour ? "Yes" : "No");
+  }
+}
+
+void saveConfiguration()
+{
+  preferences.begin("weather", false);  // Read-write mode
+  
+  preferences.putString("wifiSsid", cfg_wifiSsid);
+  preferences.putString("wifiPass", cfg_wifiPassword);
+  preferences.putString("postalCode", cfg_postalCode);
+  preferences.putString("countryCode", cfg_countryCode);
+  preferences.putBool("useCelsius", cfg_useCelsius);
+  preferences.putBool("use24Hour", cfg_use24Hour);
+  
+  preferences.end();
+  
+  configValid = true;
+  Serial.println("Configuration saved!");
+}
+
+void clearConfiguration()
+{
+  preferences.begin("weather", false);
+  preferences.clear();
+  preferences.end();
+  configValid = false;
+  Serial.println("Configuration cleared!");
+}
+
+// =============================================================================
+// CAPTIVE PORTAL HTML
+// =============================================================================
+
+const char SETUP_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Atmospheric Satellite</title>
+  <style>
+    * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+    body { margin: 0; padding: 20px; background: #1a1a2e; color: #eee; min-height: 100vh; }
+    .container { max-width: 400px; margin: 0 auto; }
+    h1 { color: #00d4ff; text-align: center; margin-bottom: 30px; font-size: 24px; }
+    h2 { color: #ff9f43; font-size: 16px; margin-top: 25px; margin-bottom: 10px; border-bottom: 1px solid #333; padding-bottom: 5px; }
+    label { display: block; margin-bottom: 5px; color: #aaa; font-size: 14px; }
+    input[type="text"], input[type="password"] { 
+      width: 100%; padding: 12px; margin-bottom: 15px; 
+      border: 1px solid #333; border-radius: 8px; 
+      background: #16213e; color: #fff; font-size: 16px;
+    }
+    input:focus { outline: none; border-color: #00d4ff; }
+    .checkbox-group { display: flex; align-items: center; margin-bottom: 15px; }
+    .checkbox-group input { width: 20px; height: 20px; margin-right: 10px; }
+    .checkbox-group label { margin-bottom: 0; }
+    button { 
+      width: 100%; padding: 15px; margin-top: 20px;
+      background: #00d4ff; color: #000; border: none; 
+      border-radius: 8px; font-size: 18px; font-weight: bold;
+      cursor: pointer; transition: background 0.3s;
+    }
+    button:hover { background: #00a8cc; }
+    .note { font-size: 12px; color: #666; margin-top: 5px; }
+    .icon { font-size: 48px; text-align: center; margin-bottom: 10px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Atmospheric Satellite</h1>
+    <form action="/save" method="POST">
+      <h2>WiFi Settings</h2>
+      <label>WiFi Network Name (SSID)</label>
+      <input type="text" name="ssid" required placeholder="Your WiFi network">
+      <label>WiFi Password</label>
+      <input type="password" name="password" placeholder="WiFi password">
+      
+      <h2>Location</h2>
+      <label>Postal/ZIP Code</label>
+      <input type="text" name="postal" required placeholder="e.g., 90210 or M5V 2E1">
+      <label>Country Code</label>
+      <input type="text" name="country" value="US" maxlength="2" placeholder="e.g., US, CA, UK">
+      <p class="note">2 digit country code</p>
+      
+      <h2>Display Preferences</h2>
+      <div class="checkbox-group">
+        <input type="checkbox" id="celsius" name="celsius" value="1">
+        <label for="celsius">Use Celsius (instead of Fahrenheit)</label>
+      </div>
+      <div class="checkbox-group">
+        <input type="checkbox" id="hour24" name="hour24" value="1">
+        <label for="hour24">Use 24-hour time format</label>
+      </div>
+      
+      <button type="submit">Save & Connect</button>
+    </form>
+  </div>
+</body>
+</html>
+)rawliteral";
+
+const char SAVE_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Settings Saved</title>
+  <style>
+    * { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+    body { margin: 0; padding: 20px; background: #1a1a2e; color: #eee; min-height: 100vh; 
+           display: flex; align-items: center; justify-content: center; text-align: center; }
+    .container { max-width: 400px; }
+    h1 { color: #00d4ff; }
+    p { color: #aaa; line-height: 1.6; }
+    .icon { font-size: 64px; margin-bottom: 20px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="icon">✅</div>
+    <h1>Settings Saved!</h1>
+    <p>Your atmospheric satellite is now configured.<br>The device will restart and connect to your WiFi network.</p>
+    <p style="color: #666; font-size: 14px; margin-top: 30px;">
+      To reconfigure later, hold the touch button while powering on the device.
+    </p>
+  </div>
+</body>
+</html>
+)rawliteral";
+
+// =============================================================================
+// CAPTIVE PORTAL HANDLERS
+// =============================================================================
+
+void handleRoot()
+{
+  server.send(200, "text/html", SETUP_HTML);
+}
+
+void handleSave()
+{
+  cfg_wifiSsid = server.arg("ssid");
+  cfg_wifiPassword = server.arg("password");
+  cfg_postalCode = server.arg("postal");
+  cfg_countryCode = server.arg("country");
+  cfg_useCelsius = server.hasArg("celsius");
+  cfg_use24Hour = server.hasArg("hour24");
+  
+  if (cfg_countryCode.length() == 0) cfg_countryCode = "US";
+  
+  saveConfiguration();
+  
+  server.send(200, "text/html", SAVE_HTML);
+  
+  // Wait a moment for the response to be sent, then restart
+  delay(3000);
+  ESP.restart();
+}
+
+void handleNotFound()
+{
+  // Redirect all requests to the setup page (captive portal behavior)
+  server.sendHeader("Location", "http://192.168.4.1/", true);
+  server.send(302, "text/plain", "");
+}
+
+void startCaptivePortal()
+{
+  setupMode = true;
+  Serial.println("\n=== Starting Captive Portal ===");
+  
+  // Display setup message
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setTextSize(2);
+  
+  tft.setCursor(50, 40);
+  tft.print("Satellite setup");
+  
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(20, 80);
+  tft.print("Connect to WiFi:");
+  
+  tft.setTextColor(ST77XX_ORANGE);
+  tft.setTextSize(2);
+  tft.setCursor(20, 110);
+  tft.print(AP_SSID);
+  
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(20, 150);
+  tft.print("On your smartphone");
+  tft.setCursor(20, 175);
+  tft.print("to configure.");
+  
+  // Start Access Point
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  
+  IPAddress apIP = WiFi.softAPIP();
+  Serial.printf("AP IP address: %s\n", apIP.toString().c_str());
+  
+  // Start DNS server (redirect all domains to our IP)
+  dnsServer.start(53, "*", apIP);
+  
+  // Setup web server routes
+  server.on("/", handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.onNotFound(handleNotFound);
+  
+  server.begin();
+  Serial.println("Web server started");
+  Serial.printf("Connect to WiFi '%s' and open any webpage\n", AP_SSID);
+}
+
+void runCaptivePortalLoop()
+{
+  dnsServer.processNextRequest();
+  server.handleClient();
+}
+
+// =============================================================================
 // HELPER FUNCTIONS
 // =============================================================================
+
+// URL encode a string (handles spaces and special characters)
+String urlEncode(const String &str)
+{
+  String encoded = "";
+  char c;
+  for (int i = 0; i < str.length(); i++)
+  {
+    c = str.charAt(i);
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~')
+    {
+      encoded += c;
+    }
+    else if (c == ' ')
+    {
+      encoded += "%20";
+    }
+    else
+    {
+      char buf[4];
+      sprintf(buf, "%%%02X", (unsigned char)c);
+      encoded += buf;
+    }
+  }
+  return encoded;
+}
 
 // Map AccuWeather icon number to local bitmap
 const unsigned char* getWeatherIcon(int iconNum)
@@ -230,7 +521,7 @@ void displayTime()
   char baseTimeStr[16];
   char timeStr[16];
   
-  if (USE_24_HOUR)
+  if (cfg_use24Hour)
   {
     sprintf(baseTimeStr, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
     if (colonVisible)
@@ -307,7 +598,7 @@ void displayTempHum()
     // Format strings using cached values
     char tempStr[16];
     char humStr[16];
-    if (USE_CELSIUS)
+    if (cfg_useCelsius)
     {
       float tempC = (cachedTempF - 32.0) * 5.0 / 9.0;
       sprintf(tempStr, "Temp: %.0f%cC", tempC, 247);  // 247 is degree symbol
@@ -391,7 +682,7 @@ void displayScreenTwo()
     tft.setTextColor(ST77XX_ORANGE, ST77XX_BLACK);
     tft.setTextSize(2);
     char highStr[8];
-    int highDisplay = USE_CELSIUS ? (int)round((forecast[i].highTemp - 32) * 5.0 / 9.0) : forecast[i].highTemp;
+    int highDisplay = cfg_useCelsius ? (int)round((forecast[i].highTemp - 32) * 5.0 / 9.0) : forecast[i].highTemp;
     sprintf(highStr, "%d%c", highDisplay, 247);
     int highWidth = strlen(highStr) * 12;  // 6 * 2 = 12 pixels per char
     int highX = colCenterX - (highWidth / 2);
@@ -402,7 +693,7 @@ void displayScreenTwo()
     tft.setTextColor(ST77XX_BLUE, ST77XX_BLACK);
     tft.setTextSize(2);
     char lowStr[8];
-    int lowDisplay = USE_CELSIUS ? (int)round((forecast[i].lowTemp - 32) * 5.0 / 9.0) : forecast[i].lowTemp;
+    int lowDisplay = cfg_useCelsius ? (int)round((forecast[i].lowTemp - 32) * 5.0 / 9.0) : forecast[i].lowTemp;
     sprintf(lowStr, "%d%c", lowDisplay, 247);
     int lowWidth = strlen(lowStr) * 12;
     int lowX = colCenterX - (lowWidth / 2);
@@ -415,7 +706,7 @@ void displayScreenTwo()
   if (getLocalTime(&timeinfo))
   {
     char timeStr[16];
-    if (USE_24_HOUR)
+    if (cfg_use24Hour)
     {
       sprintf(timeStr, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
     }
@@ -439,9 +730,9 @@ void displayScreenTwo()
 void connectToWiFi()
 {
   displayCenteredText("Connecting to Earth...", ST77XX_CYAN);
-  Serial.printf("Connecting to WiFi: %s\n", WIFI_SSID);
+  Serial.printf("Connecting to WiFi: %s\n", cfg_wifiSsid.c_str());
 
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(cfg_wifiSsid.c_str(), cfg_wifiPassword.c_str());
 
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 20)
@@ -480,8 +771,9 @@ void fetchAccuWeatherLocation()
 
   // Build the AccuWeather Location API URL
   String url = "https://dataservice.accuweather.com/locations/v1/postalcodes/search?q=";
-  url += LOCATION_POSTAL_CODE;
-  url += "&countryCode=US";
+  url += urlEncode(cfg_postalCode);
+  url += "&countryCode=";
+  url += cfg_countryCode;
 
   Serial.printf("Request URL: %s\n", url.c_str());
 
@@ -721,10 +1013,10 @@ void fetchForecast()
 void setup()
 {
   Serial.begin(115200);
-  delay(5000);
+  delay(1000);
 
   Serial.println("\n\n================================");
-  Serial.println("ESP32-C3 Weather Station");
+  Serial.println("ESP32-C3 Atmospheric Satellite");
   Serial.println("================================");
 
   // Initialize outputs
@@ -740,7 +1032,7 @@ void setup()
   // Initialize I2C first (before any I2C devices)
   Serial.println("Initializing I2C...");
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-  Wire.setClock(10000);  // 10kHz - lower frequency to reduce sensor self-heating
+  Wire.setClock(1000);  // 1kHz - very low frequency to minimize sensor self-heating
   delay(100);
 
   // Initialize display
@@ -751,7 +1043,28 @@ void setup()
   tft.fillScreen(ST77XX_BLACK);
   Serial.println("Display ready");
 
-  // Connect to WiFi
+  // Load configuration from NVS
+  loadConfiguration();
+
+  // Check if touch button is held on boot to force setup mode
+  delay(100);  // Debounce
+  bool forceSetup = (digitalRead(PIN_TOUCH) == HIGH);
+  if (forceSetup)
+  {
+    Serial.println("Touch button held - forcing setup mode");
+    // Wait for button release
+    while (digitalRead(PIN_TOUCH) == HIGH) delay(10);
+  }
+
+  // Enter setup mode if no config or touch button held
+  if (!configValid || forceSetup)
+  {
+    Serial.println("Entering setup mode...");
+    startCaptivePortal();
+    return;  // Exit setup, loop will handle captive portal
+  }
+
+  // Normal boot - connect to WiFi
   connectToWiFi();
 
   // Initialize AHT10 sensor
@@ -788,6 +1101,14 @@ void setup()
 
 void loop()
 {
+  // If in setup mode, handle captive portal
+  if (setupMode)
+  {
+    runCaptivePortalLoop();
+    delay(10);
+    return;
+  }
+
   // --- Update display every second ---
   if (millis() - lastTimeUpdate >= 1000)
   {
